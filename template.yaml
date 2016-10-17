@@ -1,0 +1,198 @@
+---
+Parameters:
+  DomainRoot:
+    Description: "Root domain name for the Route53 records. Must not be FQDN such as \"example.com\""
+    Type: String
+  DomainFQDN:
+    Description: "FQDN of root domain name. Must be FQDN such as \"example.com.\""
+    Type: String
+  SiteDomain:
+    Description: "Domain name for your website (www.example.com)"
+    Type: String
+  PriceClass:
+    Description: "Price class. Default is US-only, PriceClass_All is worldwide"
+    Default: PriceClass_100
+    AllowedValues:
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+    Type: String
+  CacheMinimum:
+    Description: "Minimum cache lifetime in seconds for the CloudFront distribution"
+    Default: 90
+    Type: Number
+  CacheDefault:
+    Description: "Default cache lifetime in seconds for the CloudFront distribution (default 30 minutes)"
+    Default: 1800
+    Type: Number
+  CacheMaximum:
+    Description: "Maximum cache lifetime in seconds for the CloudFront distribution (default 3 months)"
+    Default: 7776000
+    Type: Number
+  ViewerProtocol:
+    Description: "Minimum cache lifetime in seconds for the CloudFront distribution"
+    Default: redirect-to-https
+    AllowedValues:
+      - redirect-to-https
+      - https-only
+      - allow-all
+    Type: String
+  SSLSupportMethod:
+    Description: >
+      SSL support options. sni-only requires all clients support SNI (so no
+      IE5, etc) or vip (Virtual IP address). VIP support requires costs way
+      more per month, and SNI is supported by a vast majority of devices.
+    Default: sni-only
+    AllowedValues:
+      - sni-only
+      - vip
+    Type: String
+Resources:
+  StaticBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      AccessControl: PublicRead
+      WebsiteConfiguration:
+        ErrorDocument: 404.html
+        IndexDocument: index.html
+  WWWBucket:
+    Type: "AWS::S3::Bucket"
+    Description: "Aliased bucket for www.domain.com"
+    Properties:
+      BucketName: !Join [".", [ "www", !Ref SiteDomain ]]
+      WebsiteConfiguration:
+        RedirectAllRequestsTo:
+          HostName: !Ref SiteDomain
+  SSLCert:
+    Type: "AWS::CertificateManager::Certificate"
+    Properties:
+      DomainName: !Ref SiteDomain
+      DomainValidationOptions:
+        - DomainName: !Ref SiteDomain
+          ValidationDomain: !Ref DomainRoot
+  CDN:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        PriceClass: !Ref PriceClass
+        CustomErrorResponses:
+          - ErrorCachingMinTTL: 10
+            ErrorCode: 400
+          - ErrorCachingMinTTL: 30
+            ErrorCode: 403
+          - ErrorCachingMinTTL: 30
+            ErrorCode: 404
+        ViewerCertificate:
+          AcmCertificateArn: !Ref SSLCert
+          SslSupportMethod: !Ref SSLSupportMethod
+        Aliases:
+          - !Ref SiteDomain
+        Origins:
+          - Id: s3origin
+            DomainName:
+              !Join
+                - .
+                -
+                  - !Ref StaticBucket
+                  - !FindInMap [ RegionMap, !Ref "AWS::Region", WebEndpoint ]
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          # CFN supports gzipped content now
+          Compress: true
+          # Allows cachebusting with things like /css/site.css?h=3958efd
+          ForwardedValues:
+            QueryString: true
+          TargetOriginId: s3origin
+          ViewerProtocolPolicy: !Ref ViewerProtocol
+          MinTTL: !Ref CacheMinimum
+          DefaultTTL: !Ref CacheDefault
+          MaxTTL: !Ref CacheMaximum
+  SiteDomainRecords:
+    Type: "AWS::Route53::RecordSetGroup"
+    Properties:
+      HostedZoneName: !Ref DomainFQDN
+      Comment: !Sub "DNS records associated with ${SiteDomain} static site"
+      RecordSets:
+        - Name: !Ref SiteDomain
+          Type: A
+          AliasTarget:
+            DNSName: !GetAtt CDN.DomainName
+            # magic cloudfront hosted zone id
+            # see http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-route53-aliastarget.html
+            HostedZoneId: Z2FDTNDATAQYW2
+        - Name: !Join [".", [ "www", !Ref SiteDomain ]]
+          Type: A
+          AliasTarget:
+            DNSName: !FindInMap [ RegionMap, !Ref "AWS::Region", WebEndpoint ]
+            HostedZoneId: !FindInMap [ RegionMap, !Ref "AWS::Region", ZoneId ]
+        - Name: !Ref SiteDomain
+          # (Oct. 2016) This AAAA record only works for some CloudFront
+          # distributions because IPv6 support isn't rolled out entirely
+          Type: AAAA
+          AliasTarget:
+            DNSName: !GetAtt CDN.DomainName
+            # magic cloudfront hosted zone id
+            # see http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-route53-aliastarget.html
+            HostedZoneId: Z2FDTNDATAQYW2
+Outputs:
+  CdnDns:
+    Value: !GetAtt CDN.DomainName
+  BucketName:
+    Value: !Ref StaticBucket
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Domain Name Info
+        Parameters:
+          - DomainRoot
+          - DomainFQDN
+          - SiteDomain
+      - Label:
+          default: CloudFront Options
+        Parameters:
+          - PriceClass
+          - CacheMinimum
+          - CacheDefault
+          - CacheMaximum
+          - ViewerProtocol
+          - SSLSupportMethod
+Mappings:
+  RegionMap:
+    # This is a map of the S3 website endpoints as of Jan 7 2016
+    # http://docs.aws.amazon.com/general/latest/gr/rande.html#s3_region
+    # Don't edit this
+    sa-east-1:
+      WebEndpoint: "s3-website-sa-east-1.amazonaws.com"
+      ZoneId: "Z31GFT0UA1I2HV"
+    ap-northeast-1:
+      WebEndpoint: "s3-website-ap-northeast-1.amazonaws.com"
+      ZoneId: "Z2M4EHUR26P7ZW"
+    ap-northeast-2:
+      WebEndpoint: "s3-website-ap-northeast-2.amazonaws.com"
+      ZoneId: "Z3W03O7B5YMIYP"
+    ap-southeast-1:
+      WebEndpoint: "s3-website-ap-southeast-1.amazonaws.com"
+      ZoneId: "Z3O0J2DXBE1FTB"
+    ap-southeast-2:
+      WebEndpoint: "s3-website-ap-southeast-2.amazonaws.com"
+      ZoneId: "Z1WCIGYICN2BYD"
+    eu-west-1:
+      WebEndpoint: "s3-website-eu-west-1.amazonaws.com"
+      ZoneId: "Z1BKCTXD74EZPE"
+    us-west-2:
+      WebEndpoint: "s3-website-us-west-2.amazonaws.com"
+      ZoneId: "Z3BJ6K6RIION7M"
+    us-west-1:
+      WebEndpoint: "s3-website-us-west-1.amazonaws.com"
+      ZoneId: "Z2F56UZL2M1ACD"
+    us-east-1:
+      WebEndpoint: "s3-website-us-east-1.amazonaws.com"
+      ZoneId: "Z3AQBSTGFYJSTF"
+    us-east-2:
+      WebEndpoint: "s3-website-us.east-2.amazonaws.com"
+      ZoneId: "Z2O1EMRO9K5GLX"
